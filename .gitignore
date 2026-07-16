@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+
+# Futás közben keletkező adatok – nem valók a repóba
+tanito_adatok/
+whisper_lora_magyar/
+whisper_ct2_magyar/
+whisper_merged_temp/
+voicetex_backups/
+fordito_cache/
+temp_szeletek/
+voicetex_model_settings.json
+
+# Hang- és tömörített fájlok
+*.wav
+*.zip
