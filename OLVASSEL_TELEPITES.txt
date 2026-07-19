@@ -17,12 +17,12 @@ TELEPÍTÉS (egyszeri)
    szeretnéd (pl. C:\Voicetex). FONTOS: a mappa útvonalában
    lehetőleg ne legyen ékezet vagy szóköz.
 
-2. Ha még nincs Python a gépen: töltsd le a 3.12-es változatot a
-   https://www.python.org/downloads/ oldalról, és telepítéskor
-   pipáld be az "Add python.exe to PATH" opciót.
+2. Nem kell semmit előre telepíteni! Ha a gépen nincs Python, a
+   telepítő magától letölti és felteszi (winget-tel vagy a
+   python.org-ról, csendes módban, csak a te felhasználódnak).
 
 3. Dupla katt a Telepito.bat fájlra. A telepítő:
-   • megkeresi a Pythont (3.10–3.12),
+   • megkeresi a Pythont (3.10–3.12) – ha nincs, telepíti,
    • saját virtuális környezetet (venv) hoz létre a mappán belül,
    • felismeri az NVIDIA GPU-t és a hozzá való PyTorchot teszi fel
      (RTX 50xx kártyához a CUDA 12.8-as változatot),

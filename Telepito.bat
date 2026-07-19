@@ -9,7 +9,7 @@ echo   VOICETEX v3 - TELEPITO
 echo ============================================================
 echo.
 
-REM ── 1. Python keresese (3.10 - 3.12 ajanlott) ────────────────
+REM ── 1. Python keresese (3.10 - 3.12), szukseg eseten telepitese ──
 set "PYCMD="
 for %%V in (3.12 3.11 3.10) do (
     if not defined PYCMD (
@@ -19,17 +19,43 @@ for %%V in (3.12 3.11 3.10) do (
 if not defined PYCMD (
     python -c "import sys; sys.exit(0 if (3,10)<=sys.version_info[:2]<=(3,12) else 1)" >nul 2>&1 && set "PYCMD=python"
 )
+if defined PYCMD goto :python_ok
+
+echo [!] Nem talaltam Pythont a gepen - automatikus telepites indul...
+where winget >nul 2>&1
+if errorlevel 1 goto :python_letoltes
+
+echo [..] Python 3.12 telepitese winget-tel ^(eltarthat par percig^)...
+winget install -e --id Python.Python.3.12 --scope user --silent --accept-package-agreements --accept-source-agreements
+goto :python_ujraellenorzes
+
+:python_letoltes
+echo [..] Python 3.12 letoltese a python.org-rol ^(~27 MB^)...
+powershell -NoProfile -Command "[Net.ServicePointManager]::SecurityProtocol='Tls12'; Invoke-WebRequest -Uri 'https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe' -OutFile \"$env:TEMP\py312_telepito.exe\""
+if not exist "%TEMP%\py312_telepito.exe" goto :python_hiba
+echo [..] Python csendes telepitese...
+"%TEMP%\py312_telepito.exe" /quiet InstallAllUsers=0 PrependPath=1 Include_launcher=1
+del "%TEMP%\py312_telepito.exe" >nul 2>&1
+
+:python_ujraellenorzes
+REM A friss telepites utan a PATH meg nem frissult ebben az ablakban,
+REM ezert kozvetlen utvonalon keressuk a Pythont.
+set "PYCMD="
+if exist "%LOCALAPPDATA%\Programs\Python\Python312\python.exe" set "PYCMD="%LOCALAPPDATA%\Programs\Python\Python312\python.exe""
 if not defined PYCMD (
-    echo [HIBA] Nem talaltam megfelelo Pythont ^(3.10 - 3.12 kell^).
-    echo.
-    echo Telepitsd innen: https://www.python.org/downloads/
-    echo Telepiteskor pipald be: "Add python.exe to PATH"
-    echo Utana futtasd ujra ezt a telepitot.
-    pause
-    exit /b 1
+    py -3.12 -c "print()" >nul 2>&1 && set "PYCMD=py -3.12"
 )
-for /f "delims=" %%P in ('%PYCMD% -c "import sys;print(sys.version.split()[0])"') do set "PYVER=%%P"
-echo [OK] Python megtalalva: %PYVER%
+if defined PYCMD goto :python_ok
+
+:python_hiba
+echo [HIBA] A Python automatikus telepitese nem sikerult.
+echo        Telepitsd kezzel innen: https://www.python.org/downloads/
+echo        ^("Add python.exe to PATH" bepipalasaval^), majd futtasd ujra.
+pause
+exit /b 1
+
+:python_ok
+%PYCMD% -c "import sys; print('[OK] Python:', sys.version.split()[0])"
 echo.
 
 REM ── 2. Virtualis kornyezet ───────────────────────────────────
