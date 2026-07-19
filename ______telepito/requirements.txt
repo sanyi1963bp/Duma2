@@ -1,0 +1,26 @@
+# Voicetex v3 függőségek
+# (a torch-ot NEM innen telepítjük – azt a Telepito.bat választja ki
+#  GPU/CPU szerint a megfelelő CUDA-változattal)
+
+# Beszédfelismerés
+faster-whisper>=1.0.0
+ctranslate2>=4.5.0
+silero-vad>=5.0
+
+# LoRA tanítás
+transformers>=4.44.0
+datasets>=2.20.0
+peft>=0.11.0
+accelerate>=0.30.0
+
+# Hang
+sounddevice>=0.4.6
+scipy>=1.11.0
+numpy>=1.26.0
+librosa>=0.10.0
+soundfile>=0.12.0
+
+# Egyéb
+num2words>=0.5.13
+keyboard>=0.13.5
+pyttsx3>=2.90
