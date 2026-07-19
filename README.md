@@ -22,7 +22,30 @@ a saját hangodhoz tudja igazítani LoRA finomhangolással.
 
 ## Telepítés
 
-Python 3.10+ szükséges, valamint:
+### Egyszerű telepítés (ajánlott)
+
+Nem kell semmit előre telepíteni. Töltsd le a repót, majd **dupla katt a
+`Telepito.bat` fájlra**. A telepítő mindent elintéz:
+
+- ha nincs Python a gépen, automatikusan letölti és felteszi (3.10–3.12),
+- saját, elkülönített környezetet (venv) hoz létre a mappán belül,
+- felismeri az NVIDIA GPU-t, és a hozzá illő PyTorch-ot telepíti
+  (RTX 50xx / Blackwell kártyához a CUDA 12.8-as változatot; GPU nélkül
+  CPU-s változatot),
+- telepíti az összes többi csomagot, és parancsikont tesz az asztalra.
+
+Ezután indítás az asztali **Voicetex v3** ikonnal vagy a
+`Voicetex_Inditas.bat` fájllal. Az első indításkor a Whisper modell (~3 GB)
+egyszer letöltődik, utána helyi gyorsítótárból tölt, internet nélkül is.
+
+Részletes útmutató és hibaelhárítás: [OLVASSEL_TELEPITES.txt](OLVASSEL_TELEPITES.txt).
+
+A feliratmodul videó-hangkinyeréséhez [ffmpeg](https://ffmpeg.org/download.html)
+is szükséges (ezt külön kell telepíteni).
+
+### Kézi telepítés (haladóknak)
+
+Ha inkább magad állítod be a környezetet, Python 3.10+ szükséges, valamint:
 
 ```
 pip install faster-whisper ctranslate2 transformers peft datasets torch
@@ -30,8 +53,7 @@ pip install sounddevice scipy numpy keyboard silero-vad
 pip install librosa soundfile pyttsx3 num2words
 ```
 
-A feliratmodul videó-hangkinyeréséhez [ffmpeg](https://ffmpeg.org/download.html)
-is kell. A `large-v3` és `large-v3-turbo` modellekhez friss faster-whisper
+A `large-v3` és `large-v3-turbo` modellekhez friss faster-whisper
 szükséges (`pip install -U faster-whisper ctranslate2`).
 
 ## Használat
