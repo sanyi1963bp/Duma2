@@ -62,17 +62,16 @@ except Exception:
     SILERO_VAD_ELERHETO = False
 
 # ── LoRA tanítás (HuggingFace / PEFT) ────────────────────────────────────────
-from transformers import WhisperProcessor, WhisperForConditionalGeneration
-from transformers import Seq2SeqTrainer, Seq2SeqTrainingArguments
-from datasets import Dataset
-from peft import LoraConfig, get_peft_model, PeftModel
+# OPTIMALIZÁLÁS: a transformers / datasets / peft import ~10-20 mp-cel lassította
+# az app INDULÁSÁT, pedig csak tanításkor / fordításkor kellenek. Mostantól
+# lazy importtal, csak az első használatkor töltődnek be.
+import importlib.util
 
-# ── Helsinki-NLP fordítómodell (en→hu) ──────────────────────────────────
-try:
-    from transformers import MarianMTModel, MarianTokenizer
-    FORDITO_ELERHETO = True
-except Exception:
-    FORDITO_ELERHETO = False
+TANITAS_ELERHETO = all(
+    importlib.util.find_spec(m) is not None
+    for m in ("transformers", "datasets", "peft")
+)
+FORDITO_ELERHETO = importlib.util.find_spec("transformers") is not None
 
 # ── BEÁLLÍTÁSOK ───────────────────────────────────────────────────────────────
 MINTAVETELI_FREKVENCIA = 16000
@@ -99,7 +98,14 @@ BACKUP_DIR             = "./voicetex_backups"
 # VAD hangolás
 VAD_KUSZOB             = 0.45   # érzékenység (0–1, kisebb = érzékenyebb)
 VAD_CSEND_MS           = 900    # ennyi ms csend után áll meg a felvétel
+                                # (⚡ 500-600-ra csökkentve érezhetően fürgébb,
+                                #  de hosszabb gondolkodási szünetnél elvághat)
 VAD_PADDING_MS         = 120    # rövid puffer a szavak elejére/végére
+
+# Diktálási sebesség/pontosság kompromisszum:
+# beam_size=1 (greedy) a leggyorsabb, large-v2-nél magyarra általában elég jó;
+# ha romlana a pontosság, állítsd vissza 3-ra.
+DIKTALAS_BEAM_SIZE     = 1
 
 # Passzív önjavító tanulás
 AUTO_TANULAS_KUSZOB    = -0.55  # avg_logprob küszöb (0=tökéletes, -1=bizonytalan)
@@ -110,27 +116,36 @@ AUTO_QUEUE_FILE        = "./tanito_adatok/auto_queue.json"
 # Film felirat modul
 FORDITO_MODELL         = "Helsinki-NLP/opus-mt-en-hu"
 FORDITO_CACHE_DIR      = "./fordito_cache"
-FELIRAT_KOTEG_MERET    = 8
+FELIRAT_KOTEG_MERET    = 8      # (⚡ GPU-n 16-32-re emelve tovább gyorsul a fordítás)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  SEGÉDFÜGGVÉNYEK
 # ─────────────────────────────────────────────────────────────────────────────
 
+# OPTIMALIZÁLÁS: előre lefordított regexek – a re.sub minden hívásnál újra
+# fordította a mintákat (a re-cache segít, de a compile + modulszintű minta
+# így is gyorsabb és tisztább).
+_RE_IRASJEL   = re.compile(r'[.,;:!?\-"()""„"«»—_]')
+_RE_SZAM      = re.compile(r'\d+')
+_RE_TOBB_SZOKOZ = re.compile(r'\s+')
+
 def szoveg_normalizalas(szoveg):
     szoveg = szoveg.lower().strip()
-    szoveg = re.sub(r'[.,;:!?\-"()""„"«»—_]', ' ', szoveg)
+    szoveg = _RE_IRASJEL.sub(' ', szoveg)
     if NUM2WORDS_ELERHETO:
-        szamok = re.findall(r'\d+', szoveg)
+        szamok = _RE_SZAM.findall(szoveg)
         for szam in sorted(szamok, key=len, reverse=True):
             try:
                 betus_szam = num2words(int(szam), lang='hu')
                 szoveg = szoveg.replace(szam, " " + betus_szam + " ")
             except Exception:
                 pass
-    szoveg = re.sub(r'\s+', ' ', szoveg).strip()
+    szoveg = _RE_TOBB_SZOKOZ.sub(' ', szoveg).strip()
     return szoveg
 
+
+import difflib
 
 def hasonlosag_arány(s1, s2):
     s1, s2 = szoveg_normalizalas(s1), szoveg_normalizalas(s2)
@@ -138,7 +153,6 @@ def hasonlosag_arány(s1, s2):
         return 0.0
     if s1 == s2:
         return 1.0
-    import difflib
     return difflib.SequenceMatcher(None, s1, s2).ratio()
 
 
@@ -169,6 +183,12 @@ HANGPARANCSOK = [
     (r'vessz[őo]t?\b',           ','),
     (r'pont\b',                  '.'),
 ]
+# OPTIMALIZÁLÁS: előre fordított minták – korábban minden diktálásnál 16 regex
+# fordult újra a hangparancs-átalakításban.
+_HANGPARANCS_COMPILED = [
+    (re.compile(r'\s*\b' + minta + r'[.,!?]*', re.IGNORECASE), jel)
+    for minta, jel in HANGPARANCSOK
+]
 
 # ÚJ: szmájli-hangparancsok. A "szmájli" kulcsszó kötelező, így normál
 # beszédben nem okoznak téves cserét. A Whisper többféle írásmódját
@@ -184,23 +204,30 @@ SMAJLI_PARANCSOK = [
     (r'(?:lájk|like)\s+' + _SM,      '👍'),
     (r'(?:mosolyg[óo]s?\s+)?' + _SM, '🙂'),
 ]
+_SMAJLI_COMPILED = [
+    (re.compile(r'\b' + minta + r'\b[.,!?]*', re.IGNORECASE), jel)
+    for minta, jel in SMAJLI_PARANCSOK
+]
+_RE_IRASJEL_SZOKOZ = re.compile(r'([.!?;,:])(?=[^\s\d])')
+_RE_SORTORES_SZOKOZ = re.compile(r'\n[ \t]+')
+_RE_SORTORES_NAGYBETU = re.compile(r'(\n+)([a-záéíóöőúüű])')
 
 def hangparancs_atalakitas(szoveg):
     """Kimondott parancsszavak írásjellé/sortöréssé/szmájlivá alakítása.
     A parancs előtti szóközt és a Whisper által mögé tett írásjelet is elnyeli."""
-    for minta, jel in HANGPARANCSOK:
-        szoveg = re.sub(r'\s*\b' + minta + r'[.,!?]*', jel, szoveg, flags=re.IGNORECASE)
+    for minta, jel in _HANGPARANCS_COMPILED:
+        szoveg = minta.sub(jel, szoveg)
     # Szmájliknál a szóköz megmarad a szó előtt ("köszi 🙂"), csak a parancs
     # szövege és az utána tett írásjel tűnik el.
-    for minta, jel in SMAJLI_PARANCSOK:
-        szoveg = re.sub(r'\b' + minta + r'\b[.,!?]*', jel, szoveg, flags=re.IGNORECASE)
+    for minta, jel in _SMAJLI_COMPILED:
+        szoveg = minta.sub(jel, szoveg)
     # Írásjel után hiányzó szóköz pótlása (sortörés elé nem kell)
-    szoveg = re.sub(r'([.!?;,:])(?=[^\s\d])', r'\1 ', szoveg)
+    szoveg = _RE_IRASJEL_SZOKOZ.sub(r'\1 ', szoveg)
     # Sortörés utáni felesleges szóköz törlése
-    szoveg = re.sub(r'\n[ \t]+', '\n', szoveg)
+    szoveg = _RE_SORTORES_SZOKOZ.sub('\n', szoveg)
     # Sortörés után nagybetűvel folytatódjon a szöveg
-    szoveg = re.sub(r'(\n+)([a-záéíóöőúüű])',
-                    lambda m: m.group(1) + m.group(2).upper(), szoveg)
+    szoveg = _RE_SORTORES_NAGYBETU.sub(
+        lambda m: m.group(1) + m.group(2).upper(), szoveg)
     return szoveg
 
 
@@ -254,8 +281,15 @@ def lora_merge_es_ct2_konvertalas(log_fn=print):
 
     merged_dir = "./whisper_merged_temp"
     try:
+        # Lazy import: csak konverziókor kell a transformers/peft.
+        from transformers import WhisperProcessor, WhisperForConditionalGeneration
+        from peft import PeftModel
+
         log_fn("🔀 LoRA súlyok beolvasztása az alap modellbe...")
-        alap = WhisperForConditionalGeneration.from_pretrained(MODEL_NAME)
+        # OPTIMALIZÁLÁS: low_cpu_mem_usage → a 3GB-os modell gyorsabban és
+        # fele annyi RAM-mal töltődik be (nem inicializál felesleges súlyokat).
+        alap = WhisperForConditionalGeneration.from_pretrained(
+            MODEL_NAME, low_cpu_mem_usage=True)
         peft_m = PeftModel.from_pretrained(alap, LORA_OUTPUT_DIR)
         merged = peft_m.merge_and_unload()
         merged.save_pretrained(merged_dir)
@@ -299,11 +333,9 @@ def lora_merge_es_ct2_konvertalas(log_fn=print):
             shutil.rmtree(merged_dir)
 
 
-def hatter_tanitas_process(hang_utvonal, javitott_szoveg, device):
-    """Egyetlen minta LoRA finomhangolása."""
-    processor = WhisperProcessor.from_pretrained(MODEL_NAME, language="hungarian", task="transcribe")
+def _audio_beolvasas_norm(hang_utvonal):
+    """WAV beolvasása float32 mono 16kHz-re normalizálva."""
     sr, audio_np = wav.read(hang_utvonal)
-
     # JAVÍTÁS: korábban a fájl tényleges mintavételi frekvenciáját (sr) eldobtuk
     # és mindig int16-ot feltételeztünk. Idegen wav-nál ez csendben hibás
     # featuret adott a tanításnak.
@@ -316,13 +348,61 @@ def hatter_tanitas_process(hang_utvonal, javitott_szoveg, device):
     if sr != MINTAVETELI_FREKVENCIA:
         from scipy.signal import resample_poly
         audio_np = resample_poly(audio_np, MINTAVETELI_FREKVENCIA, sr).astype(np.float32)
+    return audio_np
 
-    features = processor(audio_np, sampling_rate=MINTAVETELI_FREKVENCIA).input_features[0]
-    labels   = processor.tokenizer(javitott_szoveg).input_ids
 
-    dataset = Dataset.from_list([{"input_features": features.tolist(), "labels": labels}])
+def hatter_tanitas_tobb_minta(parok, device, log_fn=None):
+    """
+    OPTIMALIZÁLÁS (KRITIKUS): több (hangfájl, szöveg) pár LoRA finomhangolása
+    EGYETLEN futásban.
 
-    alap = WhisperForConditionalGeneration.from_pretrained(MODEL_NAME).to(device)
+    Korábban a kötegelt tanítás és az auto-queue mondatonként hívta az
+    egymintás tanítást, ami MINDEN mondatnál újratöltötte a ~3GB-os
+    whisper-large-v3 HF modellt (+ mondatonként zip backup és CT2 konverzió
+    is futott). 100 mondatnál ez órákat jelentett. Most:
+      - a processor és az alapmodell EGYSZER töltődik be,
+      - az összes minta egy Dataset-be kerül,
+      - a tanítási lépésszám a minták számával skálázódik (5 lépés/minta),
+    így a végeredmény tanulás szempontjából egyenértékű, de nagyságrendekkel
+    gyorsabb.
+
+    `parok`: [(wav_utvonal, javitott_szoveg), ...]
+    """
+    if not parok:
+        return
+    if not TANITAS_ELERHETO:
+        raise RuntimeError(
+            "A tanításhoz szükséges csomagok hiányoznak.\n"
+            "Telepítsd: pip install transformers datasets peft"
+        )
+    # Lazy import: a nehéz csomagok csak tanításkor töltődnek be.
+    from transformers import (WhisperProcessor, WhisperForConditionalGeneration,
+                              Seq2SeqTrainer, Seq2SeqTrainingArguments)
+    from datasets import Dataset
+    from peft import LoraConfig, get_peft_model, PeftModel
+
+    processor = WhisperProcessor.from_pretrained(
+        MODEL_NAME, language="hungarian", task="transcribe")
+
+    sorok = []
+    for i, (hang_utvonal, javitott_szoveg) in enumerate(parok, 1):
+        if log_fn and len(parok) > 1:
+            log_fn(f"   🎼 Feature előkészítés {i}/{len(parok)}...")
+        audio_np = _audio_beolvasas_norm(hang_utvonal)
+        features = processor(audio_np, sampling_rate=MINTAVETELI_FREKVENCIA).input_features[0]
+        labels   = processor.tokenizer(javitott_szoveg).input_ids
+        # Megjegyzés: np.asarray(features) marad numpy – a .tolist() konverzió
+        # feleslegesen lassú és memóriaigényes volt.
+        sorok.append({"input_features": np.asarray(features, dtype=np.float32),
+                      "labels": labels})
+
+    dataset = Dataset.from_dict({
+        "input_features": [s["input_features"] for s in sorok],
+        "labels":         [s["labels"] for s in sorok],
+    })
+
+    alap = WhisperForConditionalGeneration.from_pretrained(
+        MODEL_NAME, low_cpu_mem_usage=True).to(device)
     if os.path.exists(os.path.join(LORA_OUTPUT_DIR, "adapter_config.json")):
         model = PeftModel.from_pretrained(alap, LORA_OUTPUT_DIR, is_trainable=True).to(device)
     else:
@@ -340,7 +420,9 @@ def hatter_tanitas_process(hang_utvonal, javitott_szoveg, device):
 
     args = Seq2SeqTrainingArguments(
         output_dir=LORA_OUTPUT_DIR, per_device_train_batch_size=1,
-        learning_rate=2e-4, max_steps=5, fp16=torch.cuda.is_available(),
+        learning_rate=2e-4,
+        max_steps=5 * len(parok),                 # 5 lépés/minta, mint eddig
+        fp16=torch.cuda.is_available(),
         remove_unused_columns=False, label_names=["labels"], report_to="none"
     )
     # Transformers verziófüggő kompatibilitás:
@@ -362,10 +444,15 @@ def hatter_tanitas_process(hang_utvonal, javitott_szoveg, device):
 
     Seq2SeqTrainer(**trainer_kwargs).train()
     model.save_pretrained(LORA_OUTPUT_DIR)
-    del model
+    del model, alap
     import gc; gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+def hatter_tanitas_process(hang_utvonal, javitott_szoveg, device):
+    """Egyetlen minta LoRA finomhangolása (a többmintás tanító wrappere)."""
+    hatter_tanitas_tobb_minta([(hang_utvonal, javitott_szoveg)], device)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -502,7 +589,25 @@ class VoicetexApp:
         s.configure("TLabel",    background=self.BG_PANEL, foreground=self.FG_LIGHT)
         s.configure("TEntry",    fieldbackground=self.BG_INPUT, foreground=self.FG_LIGHT, borderwidth=0)
         s.configure("TCombobox", fieldbackground=self.BG_INPUT, background=self.BG_PANEL,
-                    foreground=self.FG_LIGHT)
+                    foreground=self.FG_LIGHT, arrowcolor=self.FG_LIGHT,
+                    selectbackground=self.BG_INPUT, selectforeground=self.FG_LIGHT)
+        # JAVÍTÁS: a combobox felirata olvashatatlan volt. Két ok:
+        # 1) "readonly"/"disabled" állapotban a ttk külön (alapértelmezetten
+        #    világos) mezőszínt és kijelölési színt használ, ezért a világos
+        #    szöveg világos mezőre került → explicit map minden állapotra;
+        # 2) a lenyíló lista nem ttk, hanem sima Tk Listbox, amit csak
+        #    option_add-dal lehet sötét módra színezni (lásd lentebb).
+        s.map("TCombobox",
+              fieldbackground=[("readonly", self.BG_INPUT), ("disabled", self.BG_PANEL)],
+              foreground=[("readonly", self.FG_LIGHT), ("disabled", "#777777")],
+              selectbackground=[("readonly", self.BG_INPUT)],
+              selectforeground=[("readonly", self.FG_LIGHT)],
+              arrowcolor=[("disabled", "#555555")])
+        # A lenyíló lista (Tk Listbox) színei:
+        self.root.option_add("*TCombobox*Listbox.background",       self.BG_INPUT)
+        self.root.option_add("*TCombobox*Listbox.foreground",       self.FG_LIGHT)
+        self.root.option_add("*TCombobox*Listbox.selectBackground", self.FG_ACCENT)
+        self.root.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
         s.configure("TButton",   background=self.BG_INPUT, foreground=self.FG_LIGHT,
                     borderwidth=1, focuscolor=self.FG_ACCENT)
         s.map("TButton",
@@ -657,16 +762,20 @@ class VoicetexApp:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-            for i, par in enumerate(koteg, 1):
-                wav_path = par["wav"]
-                szoveg   = par["text"]
-                if not os.path.exists(wav_path):
-                    print(f"[AUTO] Hiányzó fájl, kihagyva: {wav_path}", flush=True)
-                    continue
-                self.root.after(0, lambda i=i: self.log_status(
-                    f"🧠 Auto-tanítás: {i}/{len(koteg)}..."))
-                print(f"[AUTO] Tanítás {i}/{len(koteg)}: {szoveg[:50]}", flush=True)
-                hatter_tanitas_process(wav_path, szoveg, self.device)
+            # OPTIMALIZÁLÁS: korábban páronként külön tanítás futott, ami minden
+            # párnál újratöltötte a 3GB-os alapmodellt. Most az összes érvényes
+            # pár EGY tanítási menetben megy le → ~15x kevesebb modellbetöltés.
+            ervenyes_parok = []
+            for par in koteg:
+                if os.path.exists(par["wav"]):
+                    ervenyes_parok.append((par["wav"], par["text"]))
+                else:
+                    print(f"[AUTO] Hiányzó fájl, kihagyva: {par['wav']}", flush=True)
+            if ervenyes_parok:
+                self.root.after(0, lambda n=len(ervenyes_parok): self.log_status(
+                    f"🧠 Auto-tanítás: {n} pár egy menetben..."))
+                print(f"[AUTO] Tanítás egy menetben: {len(ervenyes_parok)} pár", flush=True)
+                hatter_tanitas_tobb_minta(ervenyes_parok, self.device)
 
             # Zip backup + CT2 konverzió
             lora_automatikus_mentes()
@@ -1228,6 +1337,8 @@ class VoicetexApp:
         if self._fordito_modell is not None:
             return True
         try:
+            # Lazy import: a transformers csak itt töltődik be, nem app-indításkor.
+            from transformers import MarianMTModel, MarianTokenizer
             os.makedirs(FORDITO_CACHE_DIR, exist_ok=True)
             helyi_ok = os.path.exists(os.path.join(FORDITO_CACHE_DIR, "config.json"))
             if helyi_ok:
@@ -1246,7 +1357,13 @@ class VoicetexApp:
                 self._fordito_modell.save_pretrained(FORDITO_CACHE_DIR)
                 self._felirat_log_write("   💾 Modell elmentve helyi cache-be.", "ok")
             self._fordito_modell.eval()
-            self._felirat_log_write("   ✔ Fordítómodell kész.", "ok")
+            # OPTIMALIZÁLÁS: korábban a fordítás CUDA mellett is CPU-n futott.
+            # GPU-n fp16-tal a feliratfordítás nagyságrenddel gyorsabb.
+            self._fordito_device = "cuda" if torch.cuda.is_available() else "cpu"
+            if self._fordito_device == "cuda":
+                self._fordito_modell = self._fordito_modell.half().to("cuda")
+            self._felirat_log_write(
+                f"   ✔ Fordítómodell kész ({self._fordito_device}).", "ok")
             return True
         except Exception as e:
             self._felirat_log_write(f"❌ Fordítómodell betöltési hiba: {e}", "error")
@@ -1259,7 +1376,10 @@ class VoicetexApp:
             mondatok, return_tensors="pt",
             padding=True, truncation=True, max_length=512
         )
-        with torch.no_grad():
+        dev = getattr(self, "_fordito_device", "cpu")
+        if dev == "cuda":
+            tokenizalt = {k: v.to("cuda") for k, v in tokenizalt.items()}
+        with torch.inference_mode():
             forditas_ids = self._fordito_modell.generate(**tokenizalt, num_beams=4, max_length=512)
         return [self._fordito_tokenizer.decode(t, skip_special_tokens=True) for t in forditas_ids]
 
@@ -2068,7 +2188,8 @@ class VoicetexApp:
             audio = np.concatenate(buf, axis=0)
             wav.write(fajlnev, MINTAVETELI_FREKVENCIA, (audio * 32767).astype(np.int16))
             self.utolso_hang_utvonal = fajlnev
-            self.run_inference()
+            # OPTIMALIZÁLÁS: a memóriában lévő hangot adjuk át, nem a fájlt.
+            self.run_inference(audio_np=audio.astype(np.float32))
         except Exception as e:
             self.root.after(0, lambda m=str(e): self.log_status(f"❌ VAD mentési hiba: {m}"))
 
@@ -2155,7 +2276,8 @@ class VoicetexApp:
                 else:
                     mono = total.flatten()
                 wav.write(fajlnev, MINTAVETELI_FREKVENCIA, (mono*32767).astype(np.int16))
-                self.run_inference()
+                # OPTIMALIZÁLÁS: a memóriában lévő hangot adjuk át, nem a fájlt.
+                self.run_inference(audio_np=mono.astype(np.float32))
             else:
                 self.root.after(0, self._reset_ptt_btn)
         except Exception as rec_err:
@@ -2166,12 +2288,19 @@ class VoicetexApp:
 
     # ── Whisper inferencia (faster-whisper) ───────────────────────────────────
 
-    def run_inference(self):
-        """Hangfájl átírása faster-whisper-rel, majd megjelenítés."""
+    def run_inference(self, audio_np=None):
+        """Hangfájl átírása faster-whisper-rel, majd megjelenítés.
+
+        OPTIMALIZÁLÁS: ha a hívó már memóriában tartja a hangot (PTT/VAD),
+        azt kapja meg a Whisper közvetlenül – korábban a frissen kiírt wav
+        fájlt olvastuk vissza, majd a faster-whisper PyAV-val MÉG EGYSZER
+        dekódolta ugyanazt. Ez minden diktálásnál felesleges lemez- és
+        dekódolási kört jelentett."""
         try:
             print(f"[INFO] Átírás indul: {self.utolso_hang_utvonal}", flush=True)
-            sr, audio_np = wav.read(self.utolso_hang_utvonal)
-            audio_np = audio_np.astype(np.float32) / 32767.0
+            if audio_np is None:
+                sr, audio_np = wav.read(self.utolso_hang_utvonal)
+                audio_np = audio_np.astype(np.float32) / 32767.0
             rms = float(np.sqrt(np.mean(audio_np**2)))
             print(f"[INFO] RMS={rms:.5f}", flush=True)
 
@@ -2185,10 +2314,13 @@ class VoicetexApp:
                 if fw is None:
                     raise RuntimeError("A Whisper modell éppen nincs betöltve vagy modellcsere/tanítás alatt áll. Próbáld újra pár másodperc múlva.")
                 segments_gen, _ = fw.transcribe(
-                    self.utolso_hang_utvonal,
+                    audio_np,
                     language="hu",
-                    beam_size=3,
-                    vad_filter=False
+                    beam_size=DIKTALAS_BEAM_SIZE,
+                    vad_filter=False,
+                    # OPTIMALIZÁLÁS: rövid diktálásnál az előző szövegre
+                    # kondicionálás lassít és ismétlés-hallucinációt okozhat.
+                    condition_on_previous_text=False,
                 )
                 segments_list = list(segments_gen)
             text_result = " ".join(s.text.strip() for s in segments_list).strip()
@@ -2372,9 +2504,13 @@ class VoicetexApp:
             self.root.after(100, self._update_timer)
 
     def _refresh_vu(self):
+        # OPTIMALIZÁLÁS: ez a ciklus 30ms-onként örökké fut; ha a szint nem
+        # változott (pl. tétlen app), nem piszkáljuk feleslegesen a widgeteket.
         val = min(int(self.aktualis_vu_szint * 350), 100)
-        self.vu_meter.config(value=val)
-        self.overlay_vu.config(value=val)
+        if val != getattr(self, "_utolso_vu_val", -1):
+            self._utolso_vu_val = val
+            self.vu_meter.config(value=val)
+            self.overlay_vu.config(value=val)
         self.root.after(30, self._refresh_vu)
 
     # ── Hotkey ────────────────────────────────────────────────────────────────
@@ -2475,6 +2611,17 @@ class VoicetexApp:
             temp = "./temp_szeletek"
             os.makedirs(temp, exist_ok=True)
 
+            # OPTIMALIZÁLÁS (KRITIKUS): korábban MINDEN elfogadott mondatnál
+            # lefutott a teljes lánc: 3GB-os modell betöltése + LoRA tanítás
+            # + zip backup + merge + CT2 konverzió + faster-whisper újratöltés.
+            # 100 mondatnál ez órákat jelentett és a diktáló modellt is
+            # folyamatosan ki-be rángatta. Most:
+            #   1. fázis: darabolás + átírás + egyezésvizsgálat (a betöltött
+            #      fw modellel, ami végig a memóriában marad),
+            #   2. fázis: az ÖSSZES elfogadott páron EGY tanítás, EGY backup,
+            #      EGY konverzió, EGY modell-újratöltés.
+            tanito_parok = []   # [(szelet_ut, mondat), ...]
+
             for i in range(n):
                 if self.stop_factory_requested:
                     self.log_to_factory("🛑 Leállítva.", "warning"); break
@@ -2495,11 +2642,14 @@ class VoicetexApp:
 
                 # faster-whisper inferencia a szelethez
                 # JAVÍTÁS: lock alatt, None-ellenőrzéssel (versenyhelyzet ellen).
+                # OPTIMALIZÁLÁS: a hangot memóriából adjuk át (nem fájl-útvonalat),
+                # így elmarad a felesleges újradekódolás.
                 with self.model_lock:
                     fw = getattr(self, "fw_model", None)
                     if fw is None:
                         raise RuntimeError("A Whisper modell nincs betöltve.")
-                    segs, _ = fw.transcribe(szelet_ut, language="hu",
+                    segs, _ = fw.transcribe(szelet.astype(np.float32),
+                                            language="hu",
                                             beam_size=3, vad_filter=True)
                     tipp = " ".join(seg.text.strip() for seg in segs).strip()
                 if hallucinacio_gyanus(tipp):
@@ -2515,17 +2665,26 @@ class VoicetexApp:
                     self.root.after(0, lambda v=i+1: self.factory_progress.config(value=v))
                     continue
 
-                self.log_to_factory("🧠 Tanítás...", "info")
-                # JAVÍTÁS: lock alatti modell-ürítés a `del self.fw_model` helyett.
+                tanito_parok.append((szelet_ut, mondat))
+                self.root.after(0, lambda v=i+1: self.factory_progress.config(value=v))
+                self.log_to_factory("✅ Elfogadva a tanítókötegbe.", "success")
+
+            # ── 2. fázis: egyetlen tanítás az összes elfogadott páron ────────
+            if tanito_parok:
+                self.log_to_factory(
+                    f"\n🧠 Tanítás indul: {len(tanito_parok)} pár EGY menetben...", "info")
                 self._unload_fw_model()
-                hatter_tanitas_process(szelet_ut, mondat, self.device)
+                hatter_tanitas_tobb_minta(tanito_parok, self.device,
+                                          log_fn=self.log_to_factory)
+                self.log_to_factory("💾 Zip backup...", "info")
                 lora_automatikus_mentes()
                 konv_ok = lora_merge_es_ct2_konvertalas(self.log_to_factory)
                 self.load_active_model(CUSTOM_CT2_ID if konv_ok else None)
-
-                if os.path.exists(szelet_ut): os.remove(szelet_ut)
-                self.root.after(0, lambda v=i+1: self.factory_progress.config(value=v))
-                self.log_to_factory("✅ Kész!", "success")
+                for szelet_ut, _m in tanito_parok:
+                    if os.path.exists(szelet_ut):
+                        os.remove(szelet_ut)
+            else:
+                self.log_to_factory("\nℹ️ Nem volt elfogadható tanítópár.", "warning")
 
             if os.path.exists(temp) and not os.listdir(temp):
                 os.rmdir(temp)
